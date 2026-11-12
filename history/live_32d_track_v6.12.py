@@ -301,6 +301,19 @@
 #
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
+# CHANGELOG v6.11 -> v6.12  (track JSONL / UDP snapshot export for Fusion)
+# -----------------------------------------------------------------------------
+#  ADD: optional bridge so locked boxes can feed Haneef RadarLink later.
+#   * --export-tracks PATH  append one JSON object per frame (JSONL).
+#   * --export-tracks-udp HOST:PORT  same payload as a UDP datagram (optional).
+#   * Helpers locked_box_to_track_dict / locked_boxes_to_track_list /
+#     TrackSnapshotExporter: locked-box pose is truth (box id = firmware tid
+#     OR local 1000+), NOT raw TLV-1010 tid alone. No new Kalman/EMA/
+#     hysteresis; assignment / same-tid distance veto unchanged.
+#   * Export runs alongside the Qt GUI after assign_boxes_to_clusters.
+#   * Live Parameters / window title -> v6.12.
+# -----------------------------------------------------------------------------
+#
 # CHANGELOG v6.10 -> v6.11  (same-tid distance veto, no reservation, SWITCH_FRAMES=4)
 # -----------------------------------------------------------------------------
 #  BUGS: v6.10 box stuck on an old blob then popped; trails fragmented; two
@@ -551,6 +564,8 @@ import struct
 import argparse
 import logging
 import threading
+import json
+import socket
 from collections import deque
 from dataclasses import dataclass, field, replace
 
@@ -3463,6 +3478,169 @@ def assign_boxes_to_clusters(tracks, clusters, prev_boxes, lock_radius=LOCK_RADI
     return boxes, next_local_id
 
 
+# =============================================================================
+# [v6.12] Track snapshot export — Haneef RadarLink / ti_track.summarise shape
+# =============================================================================
+# Frame JSONL object:
+#   {"frame": N, "t": <unix>, "generation": 0, "tracks": [ <track>, ... ]}
+# Each <track> matches mmWave/ti_track.summarise / Fusion radar_link:
+#   {id, x, y, z, vx, vy, vz, speed, range, conf, z_min, z_max}
+# Field mapping (locked-box pose is truth; NOT firmware tid alone):
+#   id       <- box_id (firmware TLV tid OR local 1000+ from assign_boxes)
+#   x,y,z    <- box["pos"] (cluster lock centroid); fallback draw_pos
+#   vx,vy,vz <- finite difference of last two history points / dt_hint
+#               (0 if history < 2). No new filter layer — export only.
+#   speed    <- hypot(vx, vy)
+#   range    <- hypot(x, y)
+#   conf     <- 1.0 when box["locked"] else 0.5 (holding pose)
+#   z_min    <- 0.0 (floor); z_max <- clamp_person_height(box height)
+#   generation is carried on the FRAME record (RadarLink bumps it on cfg
+#   switch); default 0 until an adaptive-cfg bridge exists.
+# =============================================================================
+
+def locked_box_to_track_dict(box_id, box, dt_hint=0.1):
+    """One locked box -> Haneef track dict. See module comment for mapping."""
+    pos = box.get("pos") or box.get("draw_pos")
+    try:
+        x = float(pos[0]); y = float(pos[1]); z = float(pos[2])
+    except Exception:
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return None
+    vx = vy = vz = 0.0
+    hist = box.get("history") or []
+    if len(hist) >= 2:
+        try:
+            a, b = hist[-2], hist[-1]
+            dt = max(float(dt_hint), 1e-3)
+            vx = (float(b[0]) - float(a[0])) / dt
+            vy = (float(b[1]) - float(a[1])) / dt
+            vz = (float(b[2]) - float(a[2])) / dt
+            if not all(math.isfinite(v) for v in (vx, vy, vz)):
+                vx = vy = vz = 0.0
+        except Exception:
+            vx = vy = vz = 0.0
+    try:
+        height = clamp_person_height(box.get("height", PERSON_HEIGHT))
+    except Exception:
+        height = float(PERSON_HEIGHT)
+    locked = bool(box.get("locked", False))
+    return {
+        "id": int(box_id),
+        "x": round(x, 3), "y": round(y, 3), "z": round(z, 3),
+        "vx": round(vx, 3), "vy": round(vy, 3), "vz": round(vz, 3),
+        "speed": round(math.hypot(vx, vy), 3),
+        "range": round(math.hypot(x, y), 3),
+        "conf": 1.0 if locked else 0.5,
+        "z_min": 0.0,
+        "z_max": round(float(height), 3),
+    }
+
+
+def locked_boxes_to_track_list(boxes, dt_hint=0.1):
+    """Exportable tracks from assign_boxes_to_clusters output.
+
+    Skips pending (one-frame) local boxes. Includes holding boxes (locked
+    False, still within DRAW_HIDE_FRAMES) so Fusion sees continuity.
+    """
+    out = []
+    for bid, b in (boxes or {}).items():
+        if not b or b.get("pending"):
+            continue
+        tr = locked_box_to_track_dict(bid, b, dt_hint=dt_hint)
+        if tr is not None:
+            out.append(tr)
+    return out
+
+
+def parse_export_udp_arg(s):
+    """HOST:PORT -> (host, port) for --export-tracks-udp."""
+    if s is None or not str(s).strip():
+        raise argparse.ArgumentTypeError("--export-tracks-udp needs HOST:PORT")
+    s = str(s).strip()
+    if ":" not in s:
+        raise argparse.ArgumentTypeError(
+            "--export-tracks-udp needs HOST:PORT (e.g. 127.0.0.1:9100)")
+    host, _, port_s = s.rpartition(":")
+    if not host:
+        raise argparse.ArgumentTypeError("--export-tracks-udp missing host")
+    try:
+        port = int(port_s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"--export-tracks-udp port must be an int: {e}") from e
+    if not (1 <= port <= 65535):
+        raise argparse.ArgumentTypeError(
+            "--export-tracks-udp port must be 1..65535")
+    return host, port
+
+
+class TrackSnapshotExporter:
+    """Append one JSONL frame object and/or send it as a UDP datagram.
+
+    Thread-safe enough for the GUI thread (on_snapshot) calling write_frame;
+    close() from closeEvent / aboutToQuit.
+    """
+
+    def __init__(self, path=None, udp_addr=None, generation=0, dt_hint=0.1):
+        self.path = path
+        self.udp_addr = udp_addr  # (host, port) or None
+        self.generation = int(generation or 0)
+        self.dt_hint = float(dt_hint)
+        self._fp = None
+        self._sock = None
+        self._lock = threading.Lock()
+        if path:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._fp = open(path, "a", encoding="utf-8")
+            log.info("Track JSONL export -> %s", path)
+        if udp_addr is not None:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            log.info("Track UDP export -> %s:%s", udp_addr[0], udp_addr[1])
+
+    def write_frame(self, frame_count, boxes, t=None):
+        if self._fp is None and self._sock is None:
+            return None
+        tracks = locked_boxes_to_track_list(boxes, dt_hint=self.dt_hint)
+        rec = {
+            "frame": int(frame_count or 0),
+            "t": float(t if t is not None else time.time()),
+            "generation": int(self.generation),
+            "tracks": tracks,
+        }
+        line = json.dumps(rec, separators=(",", ":")) + "\n"
+        with self._lock:
+            if self._fp is not None:
+                try:
+                    self._fp.write(line)
+                    self._fp.flush()
+                except Exception as e:
+                    log.debug("track JSONL write failed: %s", e)
+            if self._sock is not None and self.udp_addr is not None:
+                try:
+                    self._sock.sendto(line.encode("utf-8"), self.udp_addr)
+                except Exception as e:
+                    log.debug("track UDP send failed: %s", e)
+        return rec
+
+    def close(self):
+        with self._lock:
+            if self._fp is not None:
+                try:
+                    self._fp.close()
+                except Exception:
+                    pass
+                self._fp = None
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+
 
 def clamp_person_height(h, default=PERSON_HEIGHT):
     """Clamp TLV-1012 height into a plausible standing-human range."""
@@ -4380,8 +4558,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.setWindowTitle("mmWave Radar Visualizer v6.11 - PyQtGraph/OpenGL")
+        self.setWindowTitle("mmWave Radar Visualizer v6.12 - PyQtGraph/OpenGL")
         self.resize(1680, 900)
+
+        # [v6.12] Optional Fusion-bridge track snapshot (JSONL / UDP).
+        self.track_exporter = None
+        try:
+            exp_path = getattr(args, "export_tracks", None)
+            exp_udp = getattr(args, "export_tracks_udp", None)
+            if exp_path or exp_udp:
+                self.track_exporter = TrackSnapshotExporter(
+                    path=exp_path, udp_addr=exp_udp, generation=0)
+        except Exception as e:
+            log.error("Failed to open track exporter: %s", e)
+            self.track_exporter = None
+
 
         # ---- [v5.3] thread-safe live params ---------------------------------
         self._param_lock = threading.Lock()
@@ -4641,7 +4832,7 @@ class MainWindow(QtWidgets.QMainWindow):
         host = QtWidgets.QWidget()
         vbox = QtWidgets.QVBoxLayout(host)
 
-        title = QtWidgets.QLabel("Live Parameters (v6.11)")
+        title = QtWidgets.QLabel("Live Parameters (v6.12)")
         title.setStyleSheet("QLabel { font-weight: 700; font-size: 14px; }")
         vbox.addWidget(title)
 
@@ -4729,7 +4920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox.addWidget(box_c)
 
         # D. [v6.7/v6.11] Cluster-first box lock + trail hysteresis
-        box_d = QtWidgets.QGroupBox("D. Cluster lock / trail (v6.11)")
+        box_d = QtWidgets.QGroupBox("D. Cluster lock / trail (v6.12)")
         form_d = QtWidgets.QFormLayout(box_d)
         self._add_spin_row(form_d, "CLUSTER_EPS",
             self._make_dspin("cluster_eps",
@@ -4974,6 +5165,15 @@ class MainWindow(QtWidgets.QMainWindow):
             boxes = {}
         self._boxes = boxes
         self.last_clusters = len(clusters)
+
+        # [v6.12] Snapshot locked boxes for Fusion / RadarLink (non-blocking).
+        if getattr(self, "track_exporter", None) is not None:
+            try:
+                self.track_exporter.write_frame(
+                    snapshot.get("frame_count", 0), boxes, t=time.time())
+            except Exception as e:
+                log.debug("track export failed: %s", e)
+
         if not hasattr(self, "_trail_gen"):
             self._trail_gen = {}
 
@@ -5096,6 +5296,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # The whole thing is wrapped so a shutdown-path error still lets the
         # window close instead of hanging the app.
         try:
+            # [v6.12] Flush / close track snapshot exporter before killing the thread.
+            try:
+                if getattr(self, "track_exporter", None) is not None:
+                    self.track_exporter.close()
+                    self.track_exporter = None
+            except Exception as e:
+                log.debug("track exporter close failed: %s", e)
             log.info("Window closing: stopping parser thread...")
             self.thread.stop()
             if not self.thread.wait(3000):
@@ -5146,6 +5353,14 @@ def build_arg_parser():
     ap.add_argument("--debug", action="store_true",
                      help="Verbose logging: TLV-1010 struct selection, track "
                           "counts, sanity-check rejects, raw byte previews.")
+    ap.add_argument("--export-tracks", default=None, metavar="PATH",
+                     help="[v6.12] Append one JSONL object per frame of locked "
+                          "boxes (Haneef RadarLink track shape) to PATH. Works "
+                          "with the Qt GUI running.")
+    ap.add_argument("--export-tracks-udp", type=parse_export_udp_arg, default=None,
+                     metavar="HOST:PORT",
+                     help="[v6.12] Also/instead send the same JSONL frame object "
+                          "as a UDP datagram to HOST:PORT (e.g. 127.0.0.1:9100).")
     ap.add_argument("--boundary-box", type=parse_boundary_box_arg, default=None,
                      help="[1. DETECTION VOLUME BOX] Override the 3D-view detection "
                           "volume wireframe: 'minX,maxX,minY,maxY,minZ,maxZ' in ROOM "
@@ -5184,6 +5399,12 @@ def main():
     # close sequences). Stopping the thread here too guarantees it's never
     # left running when the QThread object is destroyed at interpreter exit.
     def _ensure_thread_stopped():
+        try:
+            if getattr(win, "track_exporter", None) is not None:
+                win.track_exporter.close()
+                win.track_exporter = None
+        except Exception:
+            pass
         if win.thread.isRunning():
             log.info("aboutToQuit: stopping parser thread...")
             win.thread.stop()
